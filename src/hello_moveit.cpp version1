@@ -1,0 +1,130 @@
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <iostream>
+#include <limits>
+#include <thread>
+
+static char read_key(const std::string& prompt)
+{
+  std::cout << "\n" << prompt << " [p=plan, e=execute(async), c=cancel, r=replan, q=quit] > " << std::flush;
+  char ch = 0;
+  std::cin >> ch;
+  return ch;
+}
+
+int main(int argc, char** argv)
+{
+  rclcpp::init(argc, argv);
+  auto node = rclcpp::Node::make_shared("hello_moveit");
+
+  // 参数
+  const std::string planning_group = node->declare_parameter<std::string>("planning_group", "arm");
+  const std::string eef_link       = node->declare_parameter<std::string>("eef_link", "");
+  const std::string tf_source      = node->declare_parameter<std::string>("tf_source_frame", "slicer_line_goal");
+  const std::string planning_frame = node->declare_parameter<std::string>("planning_frame", "base_link");
+
+  // 让节点活着
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node);
+  std::thread spin_thr([&exec]() { exec.spin(); });
+
+  // TF2
+  tf2_ros::Buffer tf_buffer{node->get_clock()};
+  tf2_ros::TransformListener tf_listener{tf_buffer};
+
+  // MoveGroupInterface
+  moveit::planning_interface::MoveGroupInterface move_group(node, planning_group);
+  if (!eef_link.empty()) move_group.setEndEffectorLink(eef_link);
+  move_group.setPoseReferenceFrame(planning_frame);
+  move_group.setPlanningTime(10.0);
+  move_group.setMaxVelocityScalingFactor(0.3);
+  move_group.setMaxAccelerationScalingFactor(0.3);
+
+  // 读取 TF 目标 -> goal pose
+  geometry_msgs::msg::TransformStamped tf_msg;
+  const auto t0 = node->now();
+  while (rclcpp::ok()) {
+    try {
+      tf_msg = tf_buffer.lookupTransform(planning_frame, tf_source, tf2::TimePointZero);
+      break;
+    } catch (const tf2::TransformException& ex) {
+      if ((node->now() - t0).seconds() > 3.0) {
+        RCLCPP_ERROR(node->get_logger(), "TF lookup failed: %s", ex.what());
+        rclcpp::shutdown(); spin_thr.join(); return 1;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  }
+
+  geometry_msgs::msg::PoseStamped goal;
+  goal.header.frame_id = planning_frame;
+  goal.header.stamp    = node->get_clock()->now();
+  goal.pose.position.x = tf_msg.transform.translation.x;
+  goal.pose.position.y = tf_msg.transform.translation.y;
+  goal.pose.position.z = tf_msg.transform.translation.z;
+  goal.pose.orientation = tf_msg.transform.rotation;
+
+  RCLCPP_INFO(node->get_logger(),
+              "Target from TF '%s' in '%s': (%.3f, %.3f, %.3f)",
+              tf_source.c_str(), planning_frame.c_str(),
+              goal.pose.position.x, goal.pose.position.y, goal.pose.position.z);
+
+  // 规划缓存
+  moveit::planning_interface::MoveGroupInterface::Plan plan;
+  bool has_plan = false;
+
+  // 交互循环：支持计划、执行(异步)、取消、重新规划
+  while (rclcpp::ok()) {
+    const char k = read_key("请选择操作");
+    if (k == 'q' || k == 'Q') break;
+
+    if (k == 'p' || k == 'P') {
+      // 仅规划（plan）
+      move_group.clearPoseTargets();
+      move_group.setStartStateToCurrentState();
+      move_group.setPoseTarget(goal);
+      auto ok = (move_group.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+      has_plan = ok;
+      RCLCPP_INFO(node->get_logger(), "[plan] %s", ok ? "SUCCESS" : "FAILED");
+
+    } else if (k == 'e' || k == 'E') {
+      // 异步执行（asyncExecute），这样才能在执行中及时取消
+      if (!has_plan) {
+        RCLCPP_WARN(node->get_logger(), "No plan yet. Press 'p' to plan first.");
+        continue;
+      }
+      auto rc = move_group.asyncExecute(plan.trajectory_);  // 非阻塞
+      RCLCPP_INFO(node->get_logger(), "[execute-async] sent, code=%d", rc.val);
+
+    } else if (k == 'c' || k == 'C') {
+      // 取消当前执行（stop），便于随后 replan
+      move_group.stop();  // 停止当前轨迹执行（FollowJointTrajectory 会被取消）
+      RCLCPP_INFO(node->get_logger(), "[cancel] stop() requested");
+      // 如需更强制：也可取消 move_group 的 action（一般无需）
+      // move_group.getMoveGroupClient()->async_cancel_all_goals();  // 需要 rclcpp_action 处理   :contentReference[oaicite:2]{index=2}
+
+    } else if (k == 'r' || k == 'R') {
+      // 重新规划（replan）：先停止→清理目标→从当前状态重新规划
+      move_group.stop();
+      move_group.clearPoseTargets();
+      move_group.setStartStateToCurrentState();
+      move_group.setPoseTarget(goal);
+      auto ok = (move_group.plan(plan) == moveit::core::MoveItErrorCode::SUCCESS);
+      has_plan = ok;
+      RCLCPP_INFO(node->get_logger(), "[replan] %s", ok ? "SUCCESS" : "FAILED");
+
+    } else {
+      RCLCPP_WARN(node->get_logger(), "Unknown key: %c", k);
+    }
+  }
+
+  rclcpp::shutdown();
+  spin_thr.join();
+  return 0;
+}

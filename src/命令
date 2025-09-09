@@ -1,0 +1,4 @@
+$ ros2 run tf2_ros static_transform_publisher \
+  <tx> <ty> <tz> <r> <p> <y> base_link slicer_world
+
+$ ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 world slicer_world
